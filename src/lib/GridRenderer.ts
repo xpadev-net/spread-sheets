@@ -1,5 +1,6 @@
 import type { DataModel } from "./DataModel.ts";
 import { CELL_PADDING_X, LINE_HEIGHT, WRAP_VERTICAL_PADDING, ellipsize, wrapLines } from "./textLayout.ts";
+import type { ValidationStore } from "./ValidationStore.ts";
 import type { CellAddress, CellRange, ColumnDef, TextOverflowMode } from "./types.ts";
 
 export const DEFAULT_ROW_HEIGHT = 24;
@@ -8,6 +9,7 @@ export const HEADER_HEIGHT = 24;
 export const HEADER_WIDTH = 44;
 export const MIN_COL_WIDTH = 24;
 export const MIN_ROW_HEIGHT = 16;
+export const CHECKBOX_SIZE = 14;
 const RESIZE_HIT_TOLERANCE = 4;
 
 function columnLabel(col: number): string {
@@ -55,6 +57,7 @@ export type DrawParams = {
  */
 export class GridRenderer {
   #dataModel: DataModel;
+  #validationStore: ValidationStore | null;
   #colOffsets: number[]; // prefix sums, length cols + 1
   #rowOffsets: number[]; // prefix sums, length rows + 1
   #overflow: TextOverflowMode[]; // per column, length cols
@@ -64,8 +67,14 @@ export class GridRenderer {
   #autoRowHeight: boolean[];
   #headers: (string | undefined)[]; // per column; falls back to the A/B/C label when unset
 
-  constructor(dataModel: DataModel, columns?: ColumnDef[], defaultRowHeight = DEFAULT_ROW_HEIGHT) {
+  constructor(
+    dataModel: DataModel,
+    columns?: ColumnDef[],
+    validationStore?: ValidationStore | null,
+    defaultRowHeight = DEFAULT_ROW_HEIGHT,
+  ) {
     this.#dataModel = dataModel;
+    this.#validationStore = validationStore ?? null;
     this.#defaultRowHeight = defaultRowHeight;
     this.#colOffsets = [0];
     this.#overflow = [];
@@ -295,6 +304,40 @@ export class GridRenderer {
     ctx.restore();
   }
 
+  #drawCheckbox(ctx: CanvasRenderingContext2D, checked: boolean, x: number, y: number, height: number): void {
+    const size = CHECKBOX_SIZE;
+    const boxX = x + CELL_PADDING_X;
+    const boxY = y + (height - size) / 2;
+    const radius = 3;
+
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = checked ? "#1a73e8" : "#5f6368";
+    ctx.fillStyle = checked ? "#1a73e8" : "#ffffff";
+
+    ctx.beginPath();
+    ctx.moveTo(boxX + radius, boxY);
+    ctx.arcTo(boxX + size, boxY, boxX + size, boxY + size, radius);
+    ctx.arcTo(boxX + size, boxY + size, boxX, boxY + size, radius);
+    ctx.arcTo(boxX, boxY + size, boxX, boxY, radius);
+    ctx.arcTo(boxX, boxY, boxX + size, boxY, radius);
+    ctx.closePath();
+    if (checked) ctx.fill();
+    ctx.stroke();
+
+    if (checked) {
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(boxX + size * 0.22, boxY + size * 0.52);
+      ctx.lineTo(boxX + size * 0.42, boxY + size * 0.72);
+      ctx.lineTo(boxX + size * 0.8, boxY + size * 0.28);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
   draw(ctx: CanvasRenderingContext2D, params: DrawParams): void {
     const { scrollLeft, scrollTop, viewportWidth, viewportHeight, selection, activeCell } = params;
 
@@ -335,7 +378,9 @@ export class GridRenderer {
         ctx.strokeRect(x + 0.5, y + 0.5, width, rowHeight);
 
         const value = this.#dataModel.getValue(r, c);
-        if (value !== null) {
+        if (this.#validationStore?.getValidation(r, c)?.type === "checkbox") {
+          this.#drawCheckbox(ctx, value === true, x, y, rowHeight);
+        } else if (value !== null) {
           this.#drawCellText(ctx, String(value), x, y, width, rowHeight, this.getColumnOverflow(c));
         }
 

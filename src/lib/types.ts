@@ -19,6 +19,22 @@ export type ListValidationRule = {
   /** When true, only values from the list may be entered (no free text). */
   strict?: boolean;
   mode?: ValidationMode;
+  /**
+   * When true, the dropdown allows selecting more than one option. The
+   * cell value is stored as a comma-separated string of the selected
+   * options (e.g. "Apple, Banana").
+   */
+  multiple?: boolean;
+};
+
+/**
+ * A cell whose value is a boolean, rendered as a checkbox and toggled by
+ * clicking it (or Space/Enter while it's the active cell) instead of
+ * opening the text editor.
+ */
+export type CheckboxValidationRule = {
+  type: "checkbox";
+  mode?: ValidationMode;
 };
 
 export type NumberValidationRule = {
@@ -58,7 +74,8 @@ export type ValidationRule =
   | NumberValidationRule
   | TextValidationRule
   | DateValidationRule
-  | CustomValidationRule;
+  | CustomValidationRule
+  | CheckboxValidationRule;
 
 export type ValidationResult = {
   ok: boolean;

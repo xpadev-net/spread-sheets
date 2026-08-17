@@ -14,6 +14,7 @@ export type {
   TextValidationRule,
   DateValidationRule,
   CustomValidationRule,
+  CheckboxValidationRule,
   CellChangeEvent,
   ValidationErrorEvent,
   CellChangeSource,

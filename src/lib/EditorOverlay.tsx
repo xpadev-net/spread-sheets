@@ -80,8 +80,22 @@ export type EditorOverlayProps = {
   onCommit: (value: string, moveDelta: MoveDelta) => void;
   /** Escape while editing — discard without writing. */
   onCancel: () => void;
-  /** Arrow keys / Tab while not editing — move the selection instead of the caret. */
-  onNavigate: (dRow: number, dCol: number, extend: boolean) => void;
+  /**
+   * Arrow keys / Tab while not editing — move the selection instead of the
+   * caret. `viaTab` distinguishes a Tab-triggered move from an
+   * otherwise-identical-shaped arrow-key move (ArrowLeft/Right also produce
+   * dRow=0), so the parent can remember "the column this row's Tab run
+   * started from" for a following Enter to return to.
+   */
+  onNavigate: (dRow: number, dCol: number, extend: boolean, viaTab: boolean) => void;
+  /**
+   * Whether the active cell is a checkbox cell — blocks free typing from
+   * starting a text edit, and Space/Enter/F2 toggle its value instead of
+   * calling onBeginExisting.
+   */
+  isCheckboxCell: boolean;
+  /** Space/Enter/F2 while not editing on a checkbox cell — toggle its boolean value. */
+  onToggleCheckbox: () => void;
   /** Ctrl/Cmd+C while not editing — copy the selected range. */
   onCopy: () => void;
   /** Delete/Backspace while not editing — clear every cell in the selected range. */
@@ -173,6 +187,18 @@ export const EditorOverlay = forwardRef<EditorOverlayHandle, EditorOverlayProps>
         // keydown's default action proceed is what makes the browser fire
         // a native `paste` ClipboardEvent (handled by handlePasteEvent
         // below), which is the only way to read the text/html flavor.
+        if (props.isCheckboxCell) {
+          if (e.key === " " || e.key === "Enter" || e.key === "F2") {
+            e.preventDefault();
+            props.onToggleCheckbox();
+            return;
+          }
+          if (e.key.length === 1 && !mod) {
+            // Checkbox cells don't accept free text — only the toggle keys above act.
+            e.preventDefault();
+            return;
+          }
+        }
         switch (e.key) {
           case "Enter":
           case "F2":
@@ -181,23 +207,23 @@ export const EditorOverlay = forwardRef<EditorOverlayHandle, EditorOverlayProps>
             return;
           case "ArrowUp":
             e.preventDefault();
-            props.onNavigate(-1, 0, e.shiftKey);
+            props.onNavigate(-1, 0, e.shiftKey, false);
             return;
           case "ArrowDown":
             e.preventDefault();
-            props.onNavigate(1, 0, e.shiftKey);
+            props.onNavigate(1, 0, e.shiftKey, false);
             return;
           case "ArrowLeft":
             e.preventDefault();
-            props.onNavigate(0, -1, e.shiftKey);
+            props.onNavigate(0, -1, e.shiftKey, false);
             return;
           case "ArrowRight":
             e.preventDefault();
-            props.onNavigate(0, 1, e.shiftKey);
+            props.onNavigate(0, 1, e.shiftKey, false);
             return;
           case "Tab":
             e.preventDefault();
-            props.onNavigate(0, e.shiftKey ? -1 : 1, false);
+            props.onNavigate(0, e.shiftKey ? -1 : 1, false, true);
             return;
           case "Delete":
           case "Backspace":

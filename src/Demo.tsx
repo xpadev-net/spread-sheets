@@ -5,6 +5,7 @@ const ROWS = 30;
 const COLS = 8;
 
 const FRUITS = ["Apple", "Banana", "Cherry", "Durian", "Elderberry"];
+const TAGS = ["Urgent", "Blocked", "Review", "Backend", "Frontend"];
 
 const initialData: (string | number | boolean | null)[][] = Array.from({ length: ROWS }, () =>
   Array<string | number | boolean | null>(COLS).fill(null),
@@ -40,7 +41,9 @@ export function Demo() {
           Japanese via IME to check composition handling. Drag the small blue handle at the bottom-right of the
           selection to autofill. Select a range and press Cmd/Ctrl+C to copy, then select a (optionally larger)
           range and press Cmd/Ctrl+V to paste. Drag a column/row header's edge to resize it. Column E (row 1) has
-          overflowing text — toggle it between ellipsis and wrap below.
+          overflowing text — toggle it between ellipsis and wrap below. Column F (done): checkbox cell — click or
+          select + Space/Enter to toggle. Column G (tags): multi-select dropdown — click options to toggle them
+          in, values are stored comma-separated.
         </p>
       </div>
       <div style={{ flex: 1, minHeight: 0, border: "1px solid #dadce0", borderRadius: 4 }}>
@@ -49,7 +52,16 @@ export function Demo() {
           rows={ROWS}
           cols={COLS}
           initialData={initialData}
-          columns={[{ header: "Name" }, {}, { header: "Fruit" }, { header: "Score" }]}
+          columns={[
+            { header: "Name" },
+            {},
+            { header: "Fruit" },
+            { header: "Score" },
+            {},
+            {},
+            { header: "Done" },
+            { header: "Tags" },
+          ]}
           validations={[
             {
               range: { start: { row: 0, col: 2 }, end: { row: ROWS - 1, col: 2 } },
@@ -58,6 +70,14 @@ export function Demo() {
             {
               range: { start: { row: 0, col: 3 }, end: { row: ROWS - 1, col: 3 } },
               rule: { type: "number", min: 0, max: 100, mode: "warn" },
+            },
+            {
+              range: { start: { row: 0, col: 6 }, end: { row: ROWS - 1, col: 6 } },
+              rule: { type: "checkbox" },
+            },
+            {
+              range: { start: { row: 0, col: 7 }, end: { row: ROWS - 1, col: 7 } },
+              rule: { type: "list", values: TAGS, strict: true, multiple: true, mode: "warn" },
             },
           ]}
           onChange={handleChange}

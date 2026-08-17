@@ -98,7 +98,7 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
   const selectionManager = selectionManagerRef.current;
 
   const gridRendererRef = useRef<GridRenderer | null>(null);
-  if (!gridRendererRef.current) gridRendererRef.current = new GridRenderer(dataModel, columns);
+  if (!gridRendererRef.current) gridRendererRef.current = new GridRenderer(dataModel, columns, validationStore);
   const gridRenderer = gridRendererRef.current;
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -107,6 +107,11 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
 
   const isComposingRef = useRef(false);
   const pendingBlurRef = useRef<"commit" | null>(null);
+  // The column a Tab run started from, so a following Enter returns to it
+  // (next row) instead of continuing down whatever column Tab left you on —
+  // matches Excel/Sheets. null whenever the selection last changed via
+  // something other than Tab (click, arrow keys, ...).
+  const tabHomeColRef = useRef<number | null>(null);
   const scrollRef = useRef({ left: 0, top: 0 });
   const dprRef = useRef(1);
   const dragSelectingRef = useRef(false);
@@ -245,6 +250,11 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     setEditing(false);
   }
 
+  function toggleCheckbox(address: CellAddress) {
+    const current = dataModel.getValue(address.row, address.col);
+    commitCellValue(address, current !== true, "edit", commitCtx);
+  }
+
   function handleCanvasPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     // preventDefault() first, always — even when frozen, this stops the
     // browser's native mousedown-blur from stealing focus off the editor
@@ -252,6 +262,7 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     e.preventDefault();
     if (isComposingRef.current) return; // composition freeze invariant
     setHoveredCell(null);
+    tabHomeColRef.current = null;
 
     const local = toCanvasLocal(e.clientX, e.clientY);
     if (!local) return;
@@ -313,6 +324,9 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     dragSelectingRef.current = true;
     dragModeRef.current = "cell";
     selectionManager.moveTo(address, e.shiftKey);
+    if (!e.shiftKey && validationStore.getValidation(address.row, address.col)?.type === "checkbox") {
+      toggleCheckbox(address);
+    }
     editorRef.current?.focusCatcher();
   }
 
@@ -390,12 +404,26 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     const address = toCellAddress(e.clientX, e.clientY);
     if (!address) return;
     selectionManager.moveTo(address, false);
+    // Checkbox cells toggle via the click(s) that made up the double-click
+    // (handleCanvasPointerDown, twice) — no text editor to open.
+    if (validationStore.getValidation(address.row, address.col)?.type === "checkbox") return;
     beginExistingEdit(address);
   }
 
   function handleDropdownSelect(value: string) {
     if (isComposingRef.current) return;
     const address = selectionManager.focus;
+    const rule = validationStore.getValidation(address.row, address.col);
+    if (rule?.type === "list" && rule.multiple) {
+      // Multi-select: toggle membership in the comma-list and keep editing
+      // open — the dropdown only commits+closes on Enter/Tab/blur/Escape.
+      const current = filterText.split(",").map((s) => s.trim()).filter((s) => s !== "");
+      const idx = current.indexOf(value);
+      if (idx >= 0) current.splice(idx, 1);
+      else current.push(value);
+      editorRef.current?.beginExisting(current.join(", "));
+      return;
+    }
     commitCellValue(address, value, "dropdown", commitCtx);
     editorRef.current?.beginExisting("");
     setEditing(false);
@@ -478,14 +506,23 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
 
   const activeRule = validationStore.getValidation(selectionManager.focus.row, selectionManager.focus.col);
   const isListEditing = editing && activeRule?.type === "list";
+  const isMultiListEditing = isListEditing && activeRule.multiple === true;
+  const allListOptions = isListEditing ? (validationStore.getListOptions(selectionManager.focus, activeRule) ?? []) : [];
   const dropdownOptions = isListEditing
-    ? (validationStore.getListOptions(selectionManager.focus, activeRule) ?? []).filter(
-        (option) => filterText === "" || option.toLowerCase().includes(filterText.toLowerCase()),
-      )
+    ? isMultiListEditing
+      ? // Multi-select never filters by typed text — the box always shows
+        // the full option list with checkmarks for what's already picked,
+        // since the typed text is itself a comma-list of prior picks.
+        allListOptions
+      : allListOptions.filter((option) => filterText === "" || option.toLowerCase().includes(filterText.toLowerCase()))
     : [];
   // No dropdown box when nothing matches what's been typed — an empty
   // floating box would just be visual noise, same as any autocomplete.
   const showDropdown = isListEditing && dropdownOptions.length > 0;
+  const selectedMultiValues = isMultiListEditing
+    ? filterText.split(",").map((s) => s.trim()).filter((s) => s !== "")
+    : [];
+  const isCheckboxCell = activeRule?.type === "checkbox";
 
   function handleOverlayKeyDownCapture(e: React.KeyboardEvent) {
     if (!showDropdown) return;
@@ -687,18 +724,37 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
               setDropdownHighlight(-1);
             }}
             onBeginExisting={() => beginExistingEdit(activeCell)}
+            isCheckboxCell={isCheckboxCell}
+            onToggleCheckbox={() => toggleCheckbox(selectionManager.focus)}
             onCommit={(value, moveDelta) => {
               const address = selectionManager.focus;
               commitCellValue(address, coerceValue(value), "edit", commitCtx);
               setEditing(false);
-              if (moveDelta) selectionManager.moveBy(moveDelta.dRow, moveDelta.dCol, false);
+              if (moveDelta) {
+                if (moveDelta.dCol !== 0) {
+                  // Tab commit: remember the row-start column (first Tab in the run only).
+                  if (tabHomeColRef.current === null) tabHomeColRef.current = address.col;
+                  selectionManager.moveBy(moveDelta.dRow, moveDelta.dCol, false);
+                } else if (moveDelta.dRow !== 0 && tabHomeColRef.current !== null) {
+                  const homeCol = tabHomeColRef.current;
+                  tabHomeColRef.current = null;
+                  selectionManager.moveTo({ row: address.row + moveDelta.dRow, col: homeCol }, false);
+                } else {
+                  selectionManager.moveBy(moveDelta.dRow, moveDelta.dCol, false);
+                }
+              }
               editorRef.current?.focusCatcher();
             }}
             onCancel={() => {
               setEditing(false);
               editorRef.current?.focusCatcher();
             }}
-            onNavigate={(dRow, dCol, extend) => {
+            onNavigate={(dRow, dCol, extend, viaTab) => {
+              if (viaTab) {
+                if (tabHomeColRef.current === null) tabHomeColRef.current = selectionManager.focus.col;
+              } else {
+                tabHomeColRef.current = null;
+              }
               selectionManager.moveBy(dRow, dCol, extend);
             }}
             onCopy={handleCopy}
@@ -729,6 +785,8 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
               options={dropdownOptions}
               highlightedIndex={dropdownHighlight}
               onSelect={handleDropdownSelect}
+              multiple={isMultiListEditing}
+              selectedValues={selectedMultiValues}
             />
           )}
           {fillPreviewStyle && <div style={fillPreviewStyle} />}

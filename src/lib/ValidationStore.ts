@@ -47,10 +47,22 @@ export class ValidationStore {
       case "list": {
         if (!rule.strict) return { ok: true, mode };
         const options = this.getListOptions(address, rule) ?? [];
+        if (rule.multiple) {
+          const parts = typeof value === "string" ? value.split(",").map((p) => p.trim()).filter((p) => p !== "") : [];
+          const ok = parts.every((p) => options.includes(p));
+          return ok
+            ? { ok: true, mode }
+            : { ok: false, mode, message: `Value must be a comma-separated list of: ${options.join(", ")}` };
+        }
         const ok = typeof value === "string" && options.includes(value);
         return ok
           ? { ok: true, mode }
           : { ok: false, mode, message: `Value must be one of: ${options.join(", ")}` };
+      }
+      case "checkbox": {
+        return typeof value === "boolean"
+          ? { ok: true, mode }
+          : { ok: false, mode, message: "Value must be true or false" };
       }
       case "number": {
         const num = typeof value === "number" ? value : Number(value);
