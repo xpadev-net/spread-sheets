@@ -1,0 +1,12 @@
+.ss-viewport {
+  font-family: system-ui, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ss-canvas {
+  touch-action: none;
+}
+
+.ss-editor-overlay {
+  font-family: inherit;
+}
