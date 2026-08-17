@@ -72,6 +72,23 @@ function toTSV(values: CellValue[][]): string {
   return values.map((row) => row.map((v) => (v === null ? "" : String(v))).join("\t")).join("\n");
 }
 
+/**
+ * Splits a multi-select editor's raw text into the already-committed
+ * comma-separated picks and the trailing, still-being-typed token — e.g.
+ * "Urgent, Ba" -> confirmed ["Urgent"], currentToken "Ba". Used to filter
+ * the dropdown by what's actively being typed (not the whole string) and
+ * to know what a dropdown pick should splice into.
+ */
+function splitMultiSelectInput(text: string): { confirmed: string[]; currentToken: string } {
+  const rawParts = text.split(",");
+  const currentToken = (rawParts[rawParts.length - 1] ?? "").trim();
+  const confirmed = rawParts
+    .slice(0, -1)
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+  return { confirmed, currentToken };
+}
+
 export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(function Spreadsheet(
   props,
   ref,
@@ -123,6 +140,11 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
   );
   const rafRef = useRef<number | null>(null);
   const clipboardRef = useRef<CellValue[][] | null>(null);
+  // Set right before a dropdown-driven value change (a multi-select pick
+  // splicing the picked value into the text) so the resulting onValueChange
+  // doesn't reset the arrow/Tab-navigated highlight back to -1 — only an
+  // actual user keystroke should do that.
+  const preserveDropdownHighlightRef = useRef(false);
 
   const [, bumpVersion] = useReducer((n: number) => n + 1, 0);
   const [editing, setEditing] = useState(false);
@@ -243,10 +265,27 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     setDropdownHighlight(-1);
   }
 
+  /**
+   * coerceValue plus, for a multi-select cell, collapsing the raw typed
+   * text down to a clean comma-list — drops the trailing ", " a dropdown
+   * pick leaves for the next token, stray blank entries, and extra
+   * whitespace, so what lands in the cell always matches what a dropdown
+   * pick alone would have produced.
+   */
+  function coerceEditValue(address: CellAddress, raw: string): CellValue {
+    const rule = validationStore.getValidation(address.row, address.col);
+    if (rule?.type === "list" && rule.multiple) {
+      const { confirmed, currentToken } = splitMultiSelectInput(raw);
+      const parts = currentToken !== "" ? [...confirmed, currentToken] : confirmed;
+      return parts.length > 0 ? parts.join(", ") : null;
+    }
+    return coerceValue(raw);
+  }
+
   function commitEditIfAny() {
     if (!editing) return;
     const value = editorRef.current?.getValue() ?? "";
-    commitCellValue(selectionManager.focus, coerceValue(value), "edit", commitCtx);
+    commitCellValue(selectionManager.focus, coerceEditValue(selectionManager.focus, value), "edit", commitCtx);
     setEditing(false);
   }
 
@@ -415,13 +454,16 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     const address = selectionManager.focus;
     const rule = validationStore.getValidation(address.row, address.col);
     if (rule?.type === "list" && rule.multiple) {
-      // Multi-select: toggle membership in the comma-list and keep editing
-      // open — the dropdown only commits+closes on Enter/Tab/blur/Escape.
-      const current = filterText.split(",").map((s) => s.trim()).filter((s) => s !== "");
-      const idx = current.indexOf(value);
-      if (idx >= 0) current.splice(idx, 1);
-      else current.push(value);
-      editorRef.current?.beginExisting(current.join(", "));
+      // Multi-select: splice the picked value in for whatever token was
+      // being typed (or toggle it back out if it was already confirmed),
+      // and keep editing open — the dropdown only commits+closes on
+      // Enter/Tab/blur/Escape. A trailing ", " is left so the dropdown's
+      // filter resets to the full list, ready for the next pick.
+      const { confirmed } = splitMultiSelectInput(filterText);
+      const idx = confirmed.indexOf(value);
+      const nextConfirmed = idx >= 0 ? confirmed.filter((_, i) => i !== idx) : [...confirmed, value];
+      preserveDropdownHighlightRef.current = true;
+      editorRef.current?.beginExisting(nextConfirmed.length > 0 ? `${nextConfirmed.join(", ")}, ` : "");
       return;
     }
     commitCellValue(address, value, "dropdown", commitCtx);
@@ -508,40 +550,44 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
   const isListEditing = editing && activeRule?.type === "list";
   const isMultiListEditing = isListEditing && activeRule.multiple === true;
   const allListOptions = isListEditing ? (validationStore.getListOptions(selectionManager.focus, activeRule) ?? []) : [];
+  // Multi-select filters by the trailing token currently being typed (not
+  // the whole comma-list) so already-confirmed picks don't hide the rest
+  // of the options; single-select filters by the whole typed text.
+  const multiInput = isMultiListEditing ? splitMultiSelectInput(filterText) : null;
   const dropdownOptions = isListEditing
-    ? isMultiListEditing
-      ? // Multi-select never filters by typed text — the box always shows
-        // the full option list with checkmarks for what's already picked,
-        // since the typed text is itself a comma-list of prior picks.
-        allListOptions
+    ? multiInput
+      ? allListOptions.filter(
+          (option) => multiInput.currentToken === "" || option.toLowerCase().includes(multiInput.currentToken.toLowerCase()),
+        )
       : allListOptions.filter((option) => filterText === "" || option.toLowerCase().includes(filterText.toLowerCase()))
     : [];
   // No dropdown box when nothing matches what's been typed — an empty
   // floating box would just be visual noise, same as any autocomplete.
   const showDropdown = isListEditing && dropdownOptions.length > 0;
-  const selectedMultiValues = isMultiListEditing
-    ? filterText.split(",").map((s) => s.trim()).filter((s) => s !== "")
-    : [];
+  const selectedMultiValues = multiInput?.confirmed ?? [];
   const isCheckboxCell = activeRule?.type === "checkbox";
 
   function handleOverlayKeyDownCapture(e: React.KeyboardEvent) {
     if (!showDropdown) return;
     if (isComposingRef.current || e.nativeEvent.isComposing) return;
-    if (e.key === "ArrowDown") {
+    // Tab/Shift+Tab move the dropdown highlight the same as Down/Up while
+    // the dropdown is open, instead of committing and moving to the next
+    // cell — the dropdown's own candidates take Tab focus first.
+    if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
       e.preventDefault();
       e.stopPropagation();
       setDropdownHighlight((i) => Math.min(dropdownOptions.length - 1, i + 1));
-    } else if (e.key === "ArrowUp") {
+    } else if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) {
       e.preventDefault();
       e.stopPropagation();
-      // -1 -> 0 so the first ArrowUp with nothing highlighted lands on the
-      // first option rather than clamping to -1 forever.
+      // -1 -> 0 so the first Up/Shift+Tab with nothing highlighted lands on
+      // the first option rather than clamping to -1 forever.
       setDropdownHighlight((i) => Math.max(0, i - 1));
-    } else if (e.key === "Enter" && dropdownHighlight !== -1) {
-      // Only hijack Enter once the user has actually navigated the list
-      // with arrow keys — otherwise Enter must commit whatever text the
-      // user typed (validated normally), not silently substitute the
-      // first option in the list.
+    } else if ((e.key === "Enter" || e.key === " ") && dropdownHighlight !== -1) {
+      // Only hijack Enter/Space once the user has actually navigated the
+      // list with arrow keys (or Tab) — otherwise they must commit or type
+      // whatever text the user typed (validated normally), not silently
+      // substitute the first option in the list.
       const value = dropdownOptions[dropdownHighlight];
       if (value !== undefined) {
         e.preventDefault();
@@ -728,7 +774,7 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
             onToggleCheckbox={() => toggleCheckbox(selectionManager.focus)}
             onCommit={(value, moveDelta) => {
               const address = selectionManager.focus;
-              commitCellValue(address, coerceValue(value), "edit", commitCtx);
+              commitCellValue(address, coerceEditValue(address, value), "edit", commitCtx);
               setEditing(false);
               if (moveDelta) {
                 if (moveDelta.dCol !== 0) {
@@ -762,7 +808,11 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
             onDeleteSelection={handleDeleteSelection}
             onValueChange={(value) => {
               setFilterText(value);
-              setDropdownHighlight(-1);
+              if (preserveDropdownHighlightRef.current) {
+                preserveDropdownHighlightRef.current = false;
+              } else {
+                setDropdownHighlight(-1);
+              }
             }}
           />
           {!editing && (
