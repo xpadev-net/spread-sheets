@@ -17,6 +17,7 @@ import { GridRenderer, HEADER_HEIGHT, HEADER_WIDTH } from "./GridRenderer.ts";
 import { commitCellValue } from "./commitCellValue.ts";
 import { coerceValue } from "./coerceValue.ts";
 import { fillRange } from "./fillRange.ts";
+import { HistoryManager, type HistoryBatch } from "./HistoryManager.ts";
 import { parseClipboardData } from "./parseClipboard.ts";
 import { EditorOverlay, type EditorOverlayHandle } from "./EditorOverlay.tsx";
 import { DropdownOverlay } from "./DropdownOverlay.tsx";
@@ -25,6 +26,7 @@ import { WarningTooltip } from "./WarningTooltip.tsx";
 import {
   type CellAddress,
   type CellChangeEvent,
+  type CellChangeSource,
   type CellRange,
   type CellValue,
   type ColumnDef,
@@ -114,6 +116,10 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
   if (!selectionManagerRef.current) selectionManagerRef.current = new SelectionManager(rows, cols);
   const selectionManager = selectionManagerRef.current;
 
+  const historyRef = useRef<HistoryManager | null>(null);
+  if (!historyRef.current) historyRef.current = new HistoryManager();
+  const history = historyRef.current;
+
   const gridRendererRef = useRef<GridRenderer | null>(null);
   if (!gridRendererRef.current) gridRendererRef.current = new GridRenderer(dataModel, columns, validationStore);
   const gridRenderer = gridRendererRef.current;
@@ -164,6 +170,48 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     }),
     [dataModel, validationStore, onChange, onValidationError],
   );
+
+  /**
+   * Wraps commitCellValue for every write site and records everything that
+   * actually landed as a single undo/redo step — a whole fill, paste, or
+   * delete undoes together, matching Excel/Sheets rather than undoing one
+   * cell at a time.
+   */
+  function commitCells(
+    pairs: { address: CellAddress; value: CellValue; source: CellChangeSource }[],
+  ): HistoryBatch {
+    const batch: HistoryBatch = [];
+    for (const { address, value, source } of pairs) {
+      const oldValue = dataModel.getValue(address.row, address.col);
+      const ok = commitCellValue(address, value, source, commitCtx);
+      if (ok) batch.push({ address, oldValue, newValue: value, source });
+    }
+    if (batch.length > 0) history.push(batch);
+    return batch;
+  }
+
+  function applyHistoryBatch(batch: HistoryBatch, direction: "undo" | "redo") {
+    for (const entry of batch) {
+      const value = direction === "undo" ? entry.oldValue : entry.newValue;
+      commitCellValue(entry.address, value, entry.source, commitCtx);
+    }
+    const rows = batch.map((e) => e.address.row);
+    const cols = batch.map((e) => e.address.col);
+    selectionManager.setRange({
+      start: { row: Math.min(...rows), col: Math.min(...cols) },
+      end: { row: Math.max(...rows), col: Math.max(...cols) },
+    });
+  }
+
+  function handleUndo() {
+    const batch = history.undo();
+    if (batch) applyHistoryBatch(batch, "undo");
+  }
+
+  function handleRedo() {
+    const batch = history.redo();
+    if (batch) applyHistoryBatch(batch, "redo");
+  }
 
   const drawNow = useCallback(() => {
     const canvas = canvasRef.current;
@@ -285,13 +333,14 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
   function commitEditIfAny() {
     if (!editing) return;
     const value = editorRef.current?.getValue() ?? "";
-    commitCellValue(selectionManager.focus, coerceEditValue(selectionManager.focus, value), "edit", commitCtx);
+    const address = selectionManager.focus;
+    commitCells([{ address, value: coerceEditValue(address, value), source: "edit" }]);
     setEditing(false);
   }
 
   function toggleCheckbox(address: CellAddress) {
     const current = dataModel.getValue(address.row, address.col);
-    commitCellValue(address, current !== true, "edit", commitCtx);
+    commitCells([{ address, value: current !== true, source: "edit" }]);
   }
 
   function handleCanvasPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -466,7 +515,7 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
       editorRef.current?.beginExisting(nextConfirmed.length > 0 ? `${nextConfirmed.join(", ")}, ` : "");
       return;
     }
-    commitCellValue(address, value, "dropdown", commitCtx);
+    commitCells([{ address, value, source: "dropdown" }]);
     editorRef.current?.beginExisting("");
     setEditing(false);
     editorRef.current?.focusCatcher();
@@ -475,9 +524,7 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
   function handleCommitFill(sourceRange: CellRange, destRange: CellRange) {
     if (isComposingRef.current) return;
     const cells = fillRange(sourceRange, destRange, dataModel);
-    for (const { address, value } of cells) {
-      commitCellValue(address, value, "fill", commitCtx);
-    }
+    commitCells(cells.map(({ address, value }) => ({ address, value, source: "fill" as const })));
     selectionManager.setRange(
       normalizeRange({
         start: {
@@ -495,11 +542,13 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
   function handleDeleteSelection() {
     if (isComposingRef.current) return;
     const range = selectionManager.getRange();
+    const pairs: { address: CellAddress; value: CellValue; source: CellChangeSource }[] = [];
     for (let r = range.start.row; r <= range.end.row; r++) {
       for (let c = range.start.col; c <= range.end.col; c++) {
-        commitCellValue({ row: r, col: c }, null, "edit", commitCtx);
+        pairs.push({ address: { row: r, col: c }, value: null, source: "edit" });
       }
     }
+    commitCells(pairs);
   }
 
   function handleCopy() {
@@ -536,12 +585,14 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
     const destEndRow = Math.min(dataModel.rows - 1, selection.start.row + destRows - 1);
     const destEndCol = Math.min(dataModel.cols - 1, selection.start.col + destCols - 1);
 
+    const pairs: { address: CellAddress; value: CellValue; source: CellChangeSource }[] = [];
     for (let r = selection.start.row; r <= destEndRow; r++) {
       for (let c = selection.start.col; c <= destEndCol; c++) {
         const value = values[(r - selection.start.row) % srcRows][(c - selection.start.col) % srcCols];
-        commitCellValue({ row: r, col: c }, value, "paste", commitCtx);
+        pairs.push({ address: { row: r, col: c }, value, source: "paste" });
       }
     }
+    commitCells(pairs);
 
     selectionManager.setRange({ start: selection.start, end: { row: destEndRow, col: destEndCol } });
   }
@@ -604,22 +655,26 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
         return dataModel.getValue(row, col);
       },
       setValue(row, col, value) {
-        return commitCellValue({ row, col }, value, "api", commitCtx);
+        return commitCells([{ address: { row, col }, value, source: "api" }]).length > 0;
       },
       getRangeValues(range) {
         return dataModel.getRangeValues(normalizeRange(range));
       },
       setRangeValues(range, values) {
         const norm = normalizeRange(range);
-        const applied: CellAddress[] = [];
-        const rejected: CellAddress[] = [];
+        const pairs: { address: CellAddress; value: CellValue; source: CellChangeSource }[] = [];
         for (let r = 0; r < values.length; r++) {
           const rowValues = values[r];
           for (let c = 0; c < rowValues.length; c++) {
-            const address = { row: norm.start.row + r, col: norm.start.col + c };
-            const ok = commitCellValue(address, rowValues[c], "api", commitCtx);
-            (ok ? applied : rejected).push(address);
+            pairs.push({ address: { row: norm.start.row + r, col: norm.start.col + c }, value: rowValues[c], source: "api" });
           }
+        }
+        const batch = commitCells(pairs);
+        const appliedKeys = new Set(batch.map((e) => `${e.address.row},${e.address.col}`));
+        const applied: CellAddress[] = [];
+        const rejected: CellAddress[] = [];
+        for (const { address } of pairs) {
+          (appliedKeys.has(`${address.row},${address.col}`) ? applied : rejected).push(address);
         }
         return { applied, rejected };
       },
@@ -637,11 +692,13 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
             );
           }
         }
+        const pairs: { address: CellAddress; value: CellValue; source: CellChangeSource }[] = [];
         for (let r = 0; r < data.length; r++) {
           for (let c = 0; c < data[r].length; c++) {
-            commitCellValue({ row: r, col: c }, data[r][c], "api", commitCtx);
+            pairs.push({ address: { row: r, col: c }, value: data[r][c], source: "api" });
           }
         }
+        commitCells(pairs);
       },
       setValidation(range, rule) {
         validationStore.setValidation(normalizeRange(range), rule);
@@ -774,7 +831,7 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
             onToggleCheckbox={() => toggleCheckbox(selectionManager.focus)}
             onCommit={(value, moveDelta) => {
               const address = selectionManager.focus;
-              commitCellValue(address, coerceEditValue(address, value), "edit", commitCtx);
+              commitCells([{ address, value: coerceEditValue(address, value), source: "edit" }]);
               setEditing(false);
               if (moveDelta) {
                 if (moveDelta.dCol !== 0) {
@@ -806,6 +863,8 @@ export const Spreadsheet = forwardRef<SpreadsheetHandle, SpreadsheetProps>(funct
             onCopy={handleCopy}
             onPaste={handlePaste}
             onDeleteSelection={handleDeleteSelection}
+            onUndo={handleUndo}
+            onRedo={handleRedo}
             onValueChange={(value) => {
               setFilterText(value);
               if (preserveDropdownHighlightRef.current) {

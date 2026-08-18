@@ -100,6 +100,10 @@ export type EditorOverlayProps = {
   onCopy: () => void;
   /** Delete/Backspace while not editing — clear every cell in the selected range. */
   onDeleteSelection: () => void;
+  /** Ctrl/Cmd+Z while not editing — undo the last committed change (edit, fill, paste, delete, ...). */
+  onUndo: () => void;
+  /** Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y while not editing — redo the last undone change. */
+  onRedo: () => void;
   /**
    * Native paste while not editing — paste into the selected range. Takes
    * the ClipboardEvent's DataTransfer directly (not read via the async
@@ -181,6 +185,18 @@ export const EditorOverlay = forwardRef<EditorOverlayHandle, EditorOverlayProps>
         if (mod && (e.key === "c" || e.key === "C")) {
           e.preventDefault();
           props.onCopy();
+          return;
+        }
+        // Ctrl/Cmd+Z undoes; redo accepts both the Shift+Z (Google Sheets)
+        // and Y (Excel) conventions so either muscle memory works.
+        if (mod && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+          e.preventDefault();
+          props.onUndo();
+          return;
+        }
+        if (mod && ((e.shiftKey && (e.key === "z" || e.key === "Z")) || e.key === "y" || e.key === "Y")) {
+          e.preventDefault();
+          props.onRedo();
           return;
         }
         // Ctrl/Cmd+V is deliberately NOT intercepted here: letting the
